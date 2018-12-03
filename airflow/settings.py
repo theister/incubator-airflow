@@ -1,34 +1,58 @@
 # -*- coding: utf-8 -*-
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+#   http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 #
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import atexit
 import logging
 import os
-import sys
+import pendulum
+import socket
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, exc
 from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from airflow import configuration as conf
+from airflow.logging_config import configure_logging
+from airflow.utils.sqlalchemy import setup_event_handlers
+
+log = logging.getLogger(__name__)
+
+RBAC = conf.getboolean('webserver', 'rbac')
+
+TIMEZONE = pendulum.timezone('UTC')
+try:
+    tz = conf.get("core", "default_timezone")
+    if tz == "system":
+        TIMEZONE = pendulum.local_timezone()
+    else:
+        TIMEZONE = pendulum.timezone(tz)
+except Exception:
+    pass
+log.info("Configured default timezone %s" % TIMEZONE)
 
 
 class DummyStatsLogger(object):
-
     @classmethod
     def incr(cls, stat, count=1, rate=1):
         pass
@@ -45,18 +69,20 @@ class DummyStatsLogger(object):
     def timing(cls, stat, dt):
         pass
 
+
 Stats = DummyStatsLogger
 
-if conf.getboolean('scheduler', 'statsd_on'):
-    from statsd import StatsClient
-    statsd = StatsClient(
-        host=conf.get('scheduler', 'statsd_host'),
-        port=conf.getint('scheduler', 'statsd_port'),
-        prefix=conf.get('scheduler', 'statsd_prefix'))
-    Stats = statsd
-else:
-    Stats = DummyStatsLogger
+try:
+    if conf.getboolean('scheduler', 'statsd_on'):
+        from statsd import StatsClient
 
+        statsd = StatsClient(
+            host=conf.get('scheduler', 'statsd_host'),
+            port=conf.getint('scheduler', 'statsd_port'),
+            prefix=conf.get('scheduler', 'statsd_prefix'))
+        Stats = statsd
+except (socket.gaierror, ImportError):
+    log.warning("Could not configure StatsClient, using DummyStatsLogger instead.")
 
 HEADER = """\
   ____________       _____________
@@ -66,23 +92,20 @@ ___  ___ |  / _  /   _  __/ _  / / /_/ /_ |/ |/ /
  _/_/  |_/_/  /_/    /_/    /_/  \____/____/|__/
  """
 
-BASE_LOG_URL = '/admin/airflow/log'
-AIRFLOW_HOME = os.path.expanduser(conf.get('core', 'AIRFLOW_HOME'))
-SQL_ALCHEMY_CONN = conf.get('core', 'SQL_ALCHEMY_CONN')
 LOGGING_LEVEL = logging.INFO
-DAGS_FOLDER = os.path.expanduser(conf.get('core', 'DAGS_FOLDER'))
 
 # the prefix to append to gunicorn worker processes after init
 GUNICORN_WORKER_READY_PREFIX = "[ready] "
 
-# can't move this to conf due to ConfigParser interpolation
-LOG_FORMAT = (
-    '[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s')
-LOG_FORMAT_WITH_PID = (
-    '[%(asctime)s] [%(process)d] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s')
-LOG_FORMAT_WITH_THREAD_NAME = (
-    '[%(asctime)s] {%(filename)s:%(lineno)d} %(threadName)s %(levelname)s - %(message)s')
-SIMPLE_LOG_FORMAT = '%(asctime)s %(levelname)s - %(message)s'
+LOG_FORMAT = conf.get('core', 'log_format')
+SIMPLE_LOG_FORMAT = conf.get('core', 'simple_log_format')
+
+AIRFLOW_HOME = None
+SQL_ALCHEMY_CONN = None
+DAGS_FOLDER = None
+
+engine = None
+Session = None
 
 
 def policy(task_instance):
@@ -112,34 +135,145 @@ def policy(task_instance):
     pass
 
 
-def configure_logging(log_format=LOG_FORMAT):
-    logging.root.handlers = []
-    logging.basicConfig(
-        format=log_format, stream=sys.stdout, level=LOGGING_LEVEL)
+def configure_vars():
+    global AIRFLOW_HOME
+    global SQL_ALCHEMY_CONN
+    global DAGS_FOLDER
+    AIRFLOW_HOME = os.path.expanduser(conf.get('core', 'AIRFLOW_HOME'))
+    SQL_ALCHEMY_CONN = conf.get('core', 'SQL_ALCHEMY_CONN')
+    DAGS_FOLDER = os.path.expanduser(conf.get('core', 'DAGS_FOLDER'))
 
-engine = None
-Session = None
 
-
-def configure_orm():
+def configure_orm(disable_connection_pool=False):
+    log.debug("Setting up DB connection pool (PID %s)" % os.getpid())
     global engine
     global Session
     engine_args = {}
-    if 'sqlite' not in SQL_ALCHEMY_CONN:
-        # Engine args not supported by sqlite
-        engine_args['pool_size'] = conf.getint('core', 'SQL_ALCHEMY_POOL_SIZE')
-        engine_args['pool_recycle'] = conf.getint('core',
-                                                  'SQL_ALCHEMY_POOL_RECYCLE')
+
+    pool_connections = conf.getboolean('core', 'SQL_ALCHEMY_POOL_ENABLED')
+    if disable_connection_pool or not pool_connections:
+        engine_args['poolclass'] = NullPool
+        log.debug("settings.configure_orm(): Using NullPool")
+    elif 'sqlite' not in SQL_ALCHEMY_CONN:
+        # Pool size engine args not supported by sqlite.
+        # If no config value is defined for the pool size, select a reasonable value.
+        # 0 means no limit, which could lead to exceeding the Database connection limit.
+        try:
+            pool_size = conf.getint('core', 'SQL_ALCHEMY_POOL_SIZE')
+        except conf.AirflowConfigException:
+            pool_size = 5
+
+        # The DB server already has a value for wait_timeout (number of seconds after
+        # which an idle sleeping connection should be killed). Since other DBs may
+        # co-exist on the same server, SQLAlchemy should set its
+        # pool_recycle to an equal or smaller value.
+        try:
+            pool_recycle = conf.getint('core', 'SQL_ALCHEMY_POOL_RECYCLE')
+        except conf.AirflowConfigException:
+            pool_recycle = 1800
+
+        log.info("setting.configure_orm(): Using pool settings. pool_size={}, "
+                 "pool_recycle={}".format(pool_size, pool_recycle))
+        engine_args['pool_size'] = pool_size
+        engine_args['pool_recycle'] = pool_recycle
+
+    try:
+        # Allow the user to specify an encoding for their DB otherwise default
+        # to utf-8 so jobs & users with non-latin1 characters can still use
+        # us.
+        engine_args['encoding'] = conf.get('core', 'SQL_ENGINE_ENCODING')
+    except conf.AirflowConfigException:
+        engine_args['encoding'] = 'utf-8'
+    # For Python2 we get back a newstr and need a str
+    engine_args['encoding'] = engine_args['encoding'].__str__()
 
     engine = create_engine(SQL_ALCHEMY_CONN, **engine_args)
-    Session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=engine))
+    reconnect_timeout = conf.getint('core', 'SQL_ALCHEMY_RECONNECT_TIMEOUT')
+    setup_event_handlers(engine, reconnect_timeout)
 
-try:
-    from airflow_local_settings import *
-    logging.info("Loaded airflow_local_settings.")
-except:
+    Session = scoped_session(
+        sessionmaker(autocommit=False,
+                     autoflush=False,
+                     bind=engine,
+                     expire_on_commit=False))
+
+
+def dispose_orm():
+    """ Properly close pooled database connections """
+    log.debug("Disposing DB connection pool (PID %s)", os.getpid())
+    global engine
+    global Session
+
+    if Session:
+        Session.remove()
+        Session = None
+    if engine:
+        engine.dispose()
+        engine = None
+
+
+def configure_adapters():
+    from pendulum import Pendulum
+    try:
+        from sqlite3 import register_adapter
+        register_adapter(Pendulum, lambda val: val.isoformat(' '))
+    except ImportError:
+        pass
+    try:
+        import MySQLdb.converters
+        MySQLdb.converters.conversions[Pendulum] = MySQLdb.converters.DateTime2literal
+    except ImportError:
+        pass
+
+
+def validate_session():
+    try:
+        worker_precheck = conf.getboolean('core', 'worker_precheck')
+    except conf.AirflowConfigException:
+        worker_precheck = False
+    if not worker_precheck:
+        return True
+    else:
+        check_session = sessionmaker(bind=engine)
+        session = check_session()
+        try:
+            session.execute("select 1")
+            conn_status = True
+        except exc.DBAPIError as err:
+            log.error(err)
+            conn_status = False
+        session.close()
+        return conn_status
+
+
+def configure_action_logging():
+    """
+    Any additional configuration (register callback) for airflow.utils.action_loggers
+    module
+    :return: None
+    """
     pass
 
-configure_logging()
+
+try:
+    from airflow_local_settings import *  # noqa F403 F401
+    log.info("Loaded airflow_local_settings.")
+except Exception:
+    pass
+
+logging_class_path = configure_logging()
+configure_vars()
+configure_adapters()
+# The webservers import this file from models.py with the default settings.
 configure_orm()
+configure_action_logging()
+
+# Ensure we close DB connections at scheduler and gunicon worker terminations
+atexit.register(dispose_orm)
+
+# Const stuff
+
+KILOBYTE = 1024
+MEGABYTE = KILOBYTE * KILOBYTE
+WEB_COLORS = {'LIGHTBLUE': '#4d9de0',
+              'LIGHTORANGE': '#FF9933'}

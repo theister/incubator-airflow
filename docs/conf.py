@@ -1,5 +1,25 @@
 # -*- coding: utf-8 -*-
 #
+# flake8: noqa
+# Disable Flake8 because of all the sphinx imports
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 # Airflow documentation build configuration file, created by
 # sphinx-quickstart on Thu Oct  9 20:50:01 2014.
 #
@@ -22,8 +42,12 @@ MOCK_MODULES = [
     'mesos',
     'mesos.interface',
     'mesos.native',
-    'oauth2client.service_account',
+    'google.auth.default',
+    'google_auth_httplib2',
+    'google.oauth2.service_account',
     'pandas.io.gbq',
+    'vertica_python',
+    'pymssql'
 ]
 for mod_name in MOCK_MODULES:
     sys.modules[mod_name] = mock.Mock()
@@ -52,7 +76,12 @@ extensions = [
     'sphinx.ext.coverage',
     'sphinx.ext.viewcode',
     'sphinxarg.ext',
+    'sphinxcontrib.httpdomain',
+    'sphinx.ext.intersphinx',
 ]
+
+autodoc_default_flags = ['show-inheritance', 'members']
+
 viewcode_import = True
 
 # Add any paths that contain templates here, relative to this directory.
@@ -118,6 +147,10 @@ pygments_style = 'sphinx'
 # If true, keep warnings as "system message" paragraphs in the built documents.
 #keep_warnings = False
 
+
+intersphinx_mapping = {
+    'boto3': ('https://boto3.amazonaws.com/v1/documentation/api/latest', None),
+}
 
 # -- Options for HTML output ----------------------------------------------
 
@@ -224,7 +257,7 @@ latex_elements = {
 #  author, documentclass [howto, manual, or own class]).
 latex_documents = [
   ('index', 'Airflow.tex', u'Airflow Documentation',
-   u'Maxime Beauchemin', 'manual'),
+   u'Apache Airflow', 'manual'),
 ]
 
 # The name of an image file (relative to this directory) to place at the top of
@@ -254,7 +287,7 @@ latex_documents = [
 # (source start file, name, description, authors, manual section).
 man_pages = [
     ('index', 'airflow', u'Airflow Documentation',
-     [u'Maxime Beauchemin'], 1)
+     [u'Apache Airflow'], 1)
 ]
 
 # If true, show URL addresses after external links.
@@ -268,7 +301,7 @@ man_pages = [
 #  dir menu entry, description, category)
 texinfo_documents = [(
     'index', 'Airflow', u'Airflow Documentation',
-    u'Maxime Beauchemin', 'Airflow',
+    u'Apache Airflow', 'Airflow',
     'Airflow is a system to programmaticaly author, schedule and monitor data pipelines.',
     'Miscellaneous'
 ),]
